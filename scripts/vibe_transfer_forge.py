@@ -8,6 +8,7 @@ import modules.scripts as scripts
 from modules import shared
 from modules.processing import StableDiffusionProcessing
 from collections import OrderedDict
+import traceback
 
 MAX_VIBE_SLOTS = 4
 
@@ -109,18 +110,18 @@ def _is_ipadapter_file(filepath):
 
     try:
         if filepath.lower().endswith('.safetensors'):
-            from safetensors.torch import load_file
-            sd = load_file(filepath, device='cpu')
-        else:
-            sd = torch.load(filepath, map_location='cpu', weights_only=False)
-            if hasattr(sd, 'state_dict'):
-                sd = sd.state_dict()
-        if isinstance(sd, dict):
-            keys = list(sd.keys())[:20]
+            # Only read metadata/header keys, do not load weights
+            from safetensors import safe_open
+            with safe_open(filepath, framework='pt', device='cpu') as f:
+                keys = list(f.keys())[:20]
             if any(k.startswith("image_proj.") or k.startswith("ip_adapter.") for k in keys):
                 return True
-    except Exception:
-        pass
+        else:
+            # Only scan known IP-Adapter file names for pickle-based formats
+            # to avoid arbitrary code execution from torch.load(weights_only=False)
+            print(f"[VibeTransfer] 跳过 pickle 格式文件的安全扫描: {os.path.basename(filepath)}")
+    except Exception as e:
+        print(f"[VibeTransfer] 检查文件失败 {os.path.basename(filepath)}: {e}")
     return False
 
 
@@ -191,7 +192,11 @@ def _load_ipadapter_manual(model_path):
             from safetensors.torch import load_file
             raw = load_file(model_path, device='cpu')
         else:
-            raw = torch.load(model_path, map_location='cpu', weights_only=False)
+            try:
+                raw = torch.load(model_path, map_location='cpu', weights_only=True)
+            except Exception:
+                print("[VibeTransfer] weights_only=True 加载失败，尝试非安全模式 (仅当来源可信)")
+                raw = torch.load(model_path, map_location='cpu', weights_only=False)
 
         if not isinstance(raw, dict):
             return None
@@ -221,10 +226,12 @@ def _load_clip_vision():
                     if cv is not None:
                         print(f"[VibeTransfer] CLIP Vision 已加载: {name}")
                         return cv
-                except Exception:
+                except Exception as e:
+                    print(f"[VibeTransfer] 加载 CLIP Vision 预处理器失败 ({name}): {e}")
                     continue
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[VibeTransfer] 获取 supported_preprocessors 失败: {e}")
+        traceback.print_exc()
 
     try:
         from modules_forge.supported_preprocessor import PreprocessorClipVision
@@ -235,10 +242,12 @@ def _load_clip_vision():
                     cv = supported_preprocessors[name].load_clipvision()
                     if cv is not None:
                         return cv
-            except Exception:
+            except Exception as e:
+                print(f"[VibeTransfer] 加载 {name} 失败: {e}")
                 continue
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[VibeTransfer] 导入 PreprocessorClipVision 失败: {e}")
+        traceback.print_exc()
 
     print("[VibeTransfer] CLIP Vision 加载失败")
     return None
@@ -249,12 +258,18 @@ def compute_information_extracted_mapping(info_extracted, is_sdxl=False):
     end_pct = 1.0
     noise_level = 0.0
 
-    if info_extracted <= 0.3:
+    if info_extracted <= 0.0:
+        start_pct = 0.0
+        end_pct = 0.0
+        noise_level = 0.0
+    elif info_extracted <= 0.3:
         end_pct = info_extracted / 0.3 * 0.5
         noise_level = 0.3 - info_extracted
     elif info_extracted <= 0.7:
+        start_pct = (info_extracted - 0.3) / 0.4 * 0.2
         end_pct = 0.5 + (info_extracted - 0.3) / 0.4 * 0.4
     else:
+        start_pct = 0.2 + (info_extracted - 0.7) / 0.3 * 0.5
         end_pct = 0.9 + (info_extracted - 0.7) / 0.3 * 0.1
 
     if is_sdxl:
@@ -277,10 +292,10 @@ def _get_attention_function():
 
     def fallback_attention(q, k, v, heads, mask=None):
         b, _, dim_head = q.shape
-        scale = dim_head ** -0.5
         q = q.reshape(b, -1, heads, dim_head // heads).transpose(1, 2)
         k = k.reshape(b, -1, heads, dim_head // heads).transpose(1, 2)
         v = v.reshape(b, -1, heads, dim_head // heads).transpose(1, 2)
+        # scaled_dot_product_attention applies scale internally
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return out.transpose(1, 2).reshape(b, -1, dim_head)
 
@@ -319,7 +334,7 @@ def apply_reference_style_transfer(process, ref_pil, weight, style_fidelity, sta
         latent_image = vae.encode(ref_tensor.movedim(1, -1))
         latent_image = process.sd_model.forge_objects.vae.first_stage_model.process_in(latent_image)
 
-        gen_seed = process.seeds[0] + 1
+        gen_seed = process.seeds[0] + 1 if process.seeds else 0
         gen_cpu = torch.Generator().manual_seed(gen_seed)
 
         unet = process.sd_model.forge_objects.unet.clone()
@@ -355,9 +370,15 @@ def apply_reference_style_transfer(process, ref_pil, weight, style_fidelity, sta
                 if not (sigma_min <= sigma <= sigma_max):
                     return model, x, timestep, uncond, cond, cond_scale, model_options, seed
                 is_recording[0] = True
-                xt = latent_image.to(x) + torch.randn(x.size(), dtype=x.dtype, generator=gen_cpu).to(x) * sigma
-                sampling_fn(model, xt, timestep, uncond, cond, 1, model_options, seed)
-                is_recording[0] = False
+                try:
+                    xt = latent_image.to(x) + torch.randn(x.size(), dtype=x.dtype, generator=gen_cpu).to(x) * sigma
+                    sampling_fn(model, xt, timestep, uncond, cond, 1, model_options, seed)
+                except Exception as e:
+                    print(f"[VibeTransfer] Reference 采样步骤失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    is_recording[0] = False
                 return model, x, timestep, uncond, cond, cond_scale, model_options, seed
 
             unet.add_conditioning_modifier(conditioning_modifier)
@@ -455,7 +476,7 @@ def reinhard_color_transfer(source_img, target_img, weight):
         tgt_arr = np.array(target_img.convert("RGB")).astype(np.float32)
 
         def rgb_to_lab(arr):
-            arr = np.clip(arr, 1.0, 255.0) / 255.0
+            arr = np.clip(arr, 0.0, 255.0) / 255.0
             l = 0.3811 * arr[..., 0] + 0.5783 * arr[..., 1] + 0.0402 * arr[..., 2]
             m = 0.1967 * arr[..., 0] + 0.7244 * arr[..., 1] + 0.0782 * arr[..., 2]
             s = 0.0241 * arr[..., 0] + 0.1288 * arr[..., 1] + 0.8444 * arr[..., 2]
@@ -541,7 +562,7 @@ class VibeTransferForgeScript(scripts.Script):
 
                 def refresh_models():
                     update_ipadapter_filenames()
-                    return gr.Dropdown.update(choices=_ipadapter_names, value=_ipadapter_names[0])
+                    return gr.update(choices=_ipadapter_names, value=_ipadapter_names[0] if _ipadapter_names else None)
 
                 refresh_btn.click(
                     fn=refresh_models,
